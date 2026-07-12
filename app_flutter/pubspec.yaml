@@ -23,6 +23,10 @@ dependencies:
   # Audio recording for speech complaints
   record: ^5.1.2
 
+  # Image picker for photos
+  image_picker: ^1.1.2
+
+
   # OpenStreetMap widget
   flutter_map: ^6.1.0
 

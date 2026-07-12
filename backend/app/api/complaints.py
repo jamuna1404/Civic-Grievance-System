@@ -3,6 +3,7 @@ import tempfile
 import requests
 import logging
 import uuid
+from datetime import datetime, timedelta
 from typing import List, Optional, Any, Dict
 from fastapi import APIRouter, Depends, UploadFile, File, Form, BackgroundTasks, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,12 +13,14 @@ from sqlalchemy import func
 from app.core.database import get_db, SessionLocal
 from app.core.security import get_current_user
 from app.core.supabase import supabase_client
-from app.models.all_models import User, Complaint, ComplaintEvent, Department
+from app.models.all_models import User, Complaint, ComplaintEvent, Department, Jurisdiction
 from app.schemas.all_schemas import ComplaintRead
 from app.ml.asr import transcribe
 from app.services.nlp_classifier import classify_complaint_text
 from app.ml.image_analysis import analyze_image
 from app.services.gis_resolver import resolve_gis_jurisdiction
+from app.services.priority_engine import compute_priority
+
 
 
 
@@ -29,7 +32,7 @@ logger = logging.getLogger("complaints_api")
 async def process_complaint_pipeline(complaint_id: uuid.UUID):
     """
     Async background task executing the AI processing pipeline for a submitted complaint.
-    Under Prompt 4, it executes Speech-to-Text translation (Module 4.1).
+    Explicit, idempotent, retryable sequential pipeline: transcribe -> classify -> analyze_image -> resolve_gis -> compute_priority -> route.
     """
     logger.info(f"Kicking off processing pipeline for complaint {complaint_id}")
     
@@ -44,7 +47,7 @@ async def process_complaint_pipeline(complaint_id: uuid.UUID):
             return
 
         # 1. Speech-to-Text Transcription Module (Module 4.1)
-        if complaint.audio_url:
+        if complaint.audio_url and not complaint.transcribed_text:
             logger.info(f"Audio file found for complaint {complaint_id}. Downloading for transcription...")
             temp_path = None
             try:
@@ -65,14 +68,14 @@ async def process_complaint_pipeline(complaint_id: uuid.UUID):
 
                 logger.info(f"Running faster-whisper transcription on {temp_path}...")
                 
-                # Run transcription (SRS step 2, 3)
+                # Run transcription
                 transcription_result = transcribe(temp_path)
                 
-                # Update complaint record (SRS step 4)
+                # Update complaint record
                 complaint.transcribed_text = transcription_result["text"]
                 complaint.detected_language = transcription_result["detected_language"]
                 
-                # Log audit event (SRS step 5)
+                # Log audit event
                 # Quote FR-2.1:
                 # "FR-2.1: System shall transcribe voice complaints, detecting spoken language."
                 audit_event = ComplaintEvent(
@@ -92,7 +95,6 @@ async def process_complaint_pipeline(complaint_id: uuid.UUID):
 
             except Exception as e:
                 logger.error(f"Error during audio transcription of complaint {complaint_id}: {str(e)}")
-                # Append error to timeline for visibility
                 error_event = ComplaintEvent(
                     complaint_id=complaint_id,
                     actor_id=complaint.citizen_id,
@@ -110,12 +112,12 @@ async def process_complaint_pipeline(complaint_id: uuid.UUID):
                     except Exception as clean_err:
                         logger.error(f"Failed to delete temp file {temp_path}: {str(clean_err)}")
         else:
-            logger.info(f"No audio file present for complaint {complaint_id}. Skipping STT step.")
+            logger.info(f"STT skipped or already processed for complaint {complaint_id}.")
 
         # 2. NLP Department Classification Module (Module 4.2)
         # Prefer raw_text, fall back to transcribed_text
         text_to_classify = complaint.raw_text or complaint.transcribed_text
-        if text_to_classify:
+        if text_to_classify and complaint.department_id is None and complaint.status != "needs_review":
             logger.info(f"Running NLP classification on text: '{text_to_classify[:100]}...'")
             try:
                 # Retrieve existing departments list from DB
@@ -124,7 +126,7 @@ async def process_complaint_pipeline(complaint_id: uuid.UUID):
                 depts = depts_result.scalars().all()
                 departments_dict = {d.id: d.name for d in depts}
                 
-                # Execute classification (returns department_id, subcategory, confidence, status)
+                # Execute classification
                 nlp_res = await classify_complaint_text(text_to_classify, departments_dict)
                 
                 complaint.department_id = nlp_res["department_id"]
@@ -159,7 +161,6 @@ async def process_complaint_pipeline(complaint_id: uuid.UUID):
                 
             except Exception as e:
                 logger.error(f"Error during NLP classification of complaint {complaint_id}: {str(e)}")
-                # Append error to timeline
                 error_event = ComplaintEvent(
                     complaint_id=complaint_id,
                     actor_id=complaint.citizen_id,
@@ -169,10 +170,10 @@ async def process_complaint_pipeline(complaint_id: uuid.UUID):
                 db.add(error_event)
                 await db.commit()
         else:
-            logger.warning(f"No text (raw or transcribed) available for complaint {complaint_id}. Skipping NLP classification.")
+            logger.info(f"NLP Classification skipped or already processed for complaint {complaint_id}.")
 
         # 3. Computer Vision Image Analysis Module (Module 4.3)
-        if complaint.image_url:
+        if complaint.image_url and not complaint.cv_label:
             logger.info(f"Image found for complaint {complaint_id}. Downloading for CV analysis...")
             temp_img_path = None
             try:
@@ -222,7 +223,6 @@ async def process_complaint_pipeline(complaint_id: uuid.UUID):
                 departments_dict = {d.id: d.name for d in depts}
                 
                 # Cross-check CV label against NLP department result (FR-2.5)
-                # Map CV label to department names
                 CV_LABEL_TO_DEPT = {
                     "pothole": "Roads & Public Works",
                     "garbage pile": "Solid Waste Management",
@@ -266,7 +266,6 @@ async def process_complaint_pipeline(complaint_id: uuid.UUID):
 
             except Exception as e:
                 logger.error(f"Error during CV analysis of complaint {complaint_id}: {str(e)}")
-                # Append error to timeline
                 error_event = ComplaintEvent(
                     complaint_id=complaint_id,
                     actor_id=complaint.citizen_id,
@@ -284,88 +283,214 @@ async def process_complaint_pipeline(complaint_id: uuid.UUID):
                     except Exception as clean_err:
                         logger.error(f"Failed to delete temp file {temp_img_path}: {str(clean_err)}")
         else:
-            logger.info(f"No image present for complaint {complaint_id}. Skipping CV analysis.")
+            logger.info(f"CV analysis skipped or already processed for complaint {complaint_id}.")
 
         # 4. GIS Location Intelligence Module (Module 4.4)
-        logger.info(f"Running GIS Resolution for complaint {complaint_id}...")
-        try:
-            # Query the PostGIS Point coordinates directly using ST_X and ST_Y
-            stmt_coords = select(func.ST_X(Complaint.location), func.ST_Y(Complaint.location)).where(Complaint.id == complaint_id)
-            coords_res = await db.execute(stmt_coords)
-            coords_row = coords_res.first()
-            
-            lng_val, lat_val = None, None
-            if coords_row and coords_row[0] is not None:
-                lng_val, lat_val = coords_row[0], coords_row[1]
+        if complaint.jurisdiction_id is None and complaint.status != "needs_review":
+            logger.info(f"Running GIS Resolution for complaint {complaint_id}...")
+            try:
+                # Query the PostGIS Point coordinates directly using ST_X and ST_Y
+                stmt_coords = select(func.ST_X(Complaint.location), func.ST_Y(Complaint.location)).where(Complaint.id == complaint_id)
+                coords_res = await db.execute(stmt_coords)
+                coords_row = coords_res.first()
                 
-            # Execute GIS resolution (Polygon contains, address geocoding, centroid fallbacks)
-            gis_res = await resolve_gis_jurisdiction(
-                db=db,
-                lat=lat_val,
-                lng=lng_val,
-                address_text=complaint.address_text,
-                department_id=complaint.department_id
-            )
-            
-            complaint.jurisdiction_id = gis_res["jurisdiction_id"]
-            complaint.gis_resolution_method = gis_res["gis_resolution_method"]
-            complaint.jurisdiction_uncertain = gis_res["jurisdiction_uncertain"]
-            
-            # If geocoding resolved coordinates, save them back to PostGIS point
-            if gis_res["resolved_lat"] is not None and gis_res["resolved_lng"] is not None and (lat_val is None or lng_val is None):
-                complaint.location = func.ST_SetSRID(func.ST_MakePoint(gis_res["resolved_lng"], gis_res["resolved_lat"]), 4326)
+                lng_val, lat_val = None, None
+                if coords_row and coords_row[0] is not None:
+                    lng_val, lat_val = coords_row[0], coords_row[1]
+                    
+                # Execute GIS resolution
+                gis_res = await resolve_gis_jurisdiction(
+                    db=db,
+                    lat=lat_val,
+                    lng=lng_val,
+                    address_text=complaint.address_text,
+                    department_id=complaint.department_id
+                )
                 
-            # If location resolved to a jurisdiction, look up office details for the timeline note
-            office_desc = "None (Manual Assignment Needed)"
-            if gis_res["jurisdiction_id"]:
-                stmt_juris = select(Jurisdiction).where(Jurisdiction.id == gis_res["jurisdiction_id"])
-                juris_res = await db.execute(stmt_juris)
-                matched_j = juris_res.scalar_one_or_none()
-                if matched_j:
-                    office_desc = f"{matched_j.office_name} ({matched_j.ward}, {matched_j.zone})"
-            
-            # "FR-3.3: if no polygon contains the point, fall back to nearest jurisdiction centroid... and flag 'jurisdiction_uncertain'"
-            if gis_res["jurisdiction_uncertain"]:
-                complaint.status = "needs_review"
+                complaint.jurisdiction_id = gis_res["jurisdiction_id"]
+                complaint.gis_resolution_method = gis_res["gis_resolution_method"]
+                complaint.jurisdiction_uncertain = gis_res["jurisdiction_uncertain"]
                 
-            # Log timeline event
-            # Quote FR-3.1:
-            # "FR-3.1: System shall resolve a complaint's zone, ward, and responsible office from its location."
-            # Quote FR-3.3:
-            # "FR-3.3: System shall flag complaints whose location cannot be confidently resolved for manual assignment."
-            gis_note = (
-                f"GIS resolution complete. Assigned Office: {office_desc}. "
-                f"Method: {gis_res['gis_resolution_method']}. "
-                f"Uncertainty Flag: {gis_res['jurisdiction_uncertain']}"
-            )
-            
-            gis_event = ComplaintEvent(
-                complaint_id=complaint_id,
-                actor_id=complaint.citizen_id,
-                action="gis_resolved",
-                note=gis_note
-            )
-            db.add(gis_event)
-            await db.commit()
-            logger.info(f"GIS Resolution saved for complaint {complaint_id}")
-            
-        except Exception as e:
-            logger.error(f"Error during GIS Resolution of complaint {complaint_id}: {str(e)}")
-            error_event = ComplaintEvent(
-                complaint_id=complaint_id,
-                actor_id=complaint.citizen_id,
-                action="gis_failed",
-                note=f"System failed to resolve GIS jurisdiction: {str(e)}"
-            )
-            db.add(error_event)
-            await db.commit()
+                # If geocoding resolved coordinates, save them back to PostGIS point
+                if gis_res["resolved_lat"] is not None and gis_res["resolved_lng"] is not None and (lat_val is None or lng_val is None):
+                    complaint.location = func.ST_SetSRID(func.ST_MakePoint(gis_res["resolved_lng"], gis_res["resolved_lat"]), 4326)
+                    
+                # If location resolved to a jurisdiction, look up office details for the timeline note
+                office_desc = "None (Manual Assignment Needed)"
+                if gis_res["jurisdiction_id"]:
+                    stmt_juris = select(Jurisdiction).where(Jurisdiction.id == gis_res["jurisdiction_id"])
+                    juris_res = await db.execute(stmt_juris)
+                    matched_j = juris_res.scalar_one_or_none()
+                    if matched_j:
+                        office_desc = f"{matched_j.office_name} ({matched_j.ward}, {matched_j.zone})"
+                
+                # If no polygon contains it and fallback centroid fails, or flagged uncertain
+                if gis_res["jurisdiction_uncertain"]:
+                    complaint.status = "needs_review"
+                    
+                # Log timeline event
+                gis_note = (
+                    f"GIS resolution complete. Assigned Office: {office_desc}. "
+                    f"Method: {gis_res['gis_resolution_method']}. "
+                    f"Uncertainty Flag: {gis_res['jurisdiction_uncertain']}"
+                )
+                
+                gis_event = ComplaintEvent(
+                    complaint_id=complaint_id,
+                    actor_id=complaint.citizen_id,
+                    action="gis_resolved",
+                    note=gis_note
+                )
+                db.add(gis_event)
+                await db.commit()
+                logger.info(f"GIS Resolution saved for complaint {complaint_id}")
+                
+            except Exception as e:
+                logger.error(f"Error during GIS Resolution of complaint {complaint_id}: {str(e)}")
+                error_event = ComplaintEvent(
+                    complaint_id=complaint_id,
+                    actor_id=complaint.citizen_id,
+                    action="gis_failed",
+                    note=f"System failed to resolve GIS jurisdiction: {str(e)}"
+                )
+
+                db.add(error_event)
+                await db.commit()
+        else:
+            logger.info(f"GIS Resolution skipped or already processed for complaint {complaint_id}.")
+
+        # 5. Priority / Severity Scoring Engine (Module 4.5)
+        if complaint.priority_score is None:
+            logger.info(f"Running Priority Engine for complaint {complaint_id}...")
+            try:
+                # Query duplicate/nearby open complaints of same department in last 30 days (FR-4.2)
+                related_count = 0
+                cluster_id_to_use = None
+                
+                if complaint.location is not None and complaint.department_id is not None:
+                    cutoff_date = datetime.utcnow() - timedelta(days=30)
+                    stmt_related = select(Complaint).where(
+                        Complaint.id != complaint_id,
+                        Complaint.department_id == complaint.department_id,
+                        Complaint.status.in_(["registered", "assigned", "in_progress", "needs_review"]),
+                        Complaint.created_at >= cutoff_date,
+                        func.ST_DWithin(Complaint.location, complaint.location, 0.0009) # ~100m in Chennai coords
+                    )
+                    related_res = await db.execute(stmt_related)
+                    related_complaints = related_res.scalars().all()
+                    related_count = len(related_complaints)
+                    
+                    # Cluster duplicate linking
+                    if related_count >= 2:
+                        for rc in related_complaints:
+                            if rc.cluster_id:
+                                cluster_id_to_use = rc.cluster_id
+                                break
+                        if not cluster_id_to_use:
+                            cluster_id_to_use = uuid.uuid4()
+                            
+                        complaint.cluster_id = cluster_id_to_use
+                        for rc in related_complaints:
+                            rc.cluster_id = cluster_id_to_use
+                            
+                # Get department SLA hours
+                dept_sla_hours = None
+                if complaint.department_id:
+                    stmt_dept = select(Department).where(Department.id == complaint.department_id)
+                    dept_res = await db.execute(stmt_dept)
+                    matched_dept = dept_res.scalar_one_or_none()
+                    if matched_dept:
+                        dept_sla_hours = matched_dept.sla_hours
+                        
+                # Compute priority score
+                score, label, breakdown = compute_priority(
+                    complaint=complaint,
+                    related_complaints_count=related_count,
+                    cv_severity_hint=complaint.cv_severity,
+                    department_sla_hours=dept_sla_hours
+                )
+                
+                complaint.priority_score = score
+                complaint.priority_label = label
+                complaint.priority_breakdown = breakdown
+                
+                # Log timeline event
+                priority_event = ComplaintEvent(
+                    complaint_id=complaint_id,
+                    actor_id=complaint.citizen_id,
+                    action="priority_calculated",
+                    note=(
+                        f"Priority calculated: {score} ({label}). "
+                        f"Breakdown: base {breakdown['base_weight']}, keyword boost {breakdown['keyword_boost']}, "
+                        f"CV boost {breakdown['cv_boost']}, cluster boost {breakdown['cluster_boost']}"
+                    )
+                )
+                db.add(priority_event)
+                await db.commit()
+                logger.info(f"Priority Engine calculations saved for complaint {complaint_id}")
+                
+            except Exception as e:
+                logger.error(f"Error during Priority Engine execution for complaint {complaint_id}: {str(e)}")
+                error_event = ComplaintEvent(
+                    complaint_id=complaint_id,
+                    actor_id=complaint.citizen_id,
+                    action="priority_failed",
+                    note=f"System failed to calculate priority: {str(e)}"
+                )
+                db.add(error_event)
+                await db.commit()
+        else:
+            logger.info(f"Priority Engine skipped or already processed for complaint {complaint_id}.")
+
+        # 6. Routing Engine Module (Module 4.6)
+        # We only route if status is "registered" (not needs_review) and jurisdiction is resolved
+        if complaint.status == "registered" and complaint.jurisdiction_id is not None:
+            logger.info(f"Running Routing Engine for complaint {complaint_id}...")
+            try:
+                from app.services.routing_engine import route_complaint
+                await route_complaint(db, complaint)
+            except Exception as e:
+                logger.error(f"Error during Routing Engine execution for complaint {complaint_id}: {str(e)}")
+                error_event = ComplaintEvent(
+                    complaint_id=complaint_id,
+                    actor_id=complaint.citizen_id,
+                    action="routing_failed",
+                    note=f"System failed to route complaint: {str(e)}"
+                )
+                db.add(error_event)
+                await db.commit()
+        else:
+            logger.info(f"Routing skipped for complaint {complaint_id} (Status: {complaint.status}, Jurisdiction: {complaint.jurisdiction_id}).")
 
 
 
 
 
 
-@router.post("", status_code=status.HTTP_201_CREATED)
+
+
+import time
+from collections import defaultdict
+from fastapi import Request
+
+rate_limit_records = defaultdict(list)
+RATE_LIMIT_MAX_REQUESTS = 10
+RATE_LIMIT_WINDOW_SECONDS = 60
+
+def rate_limiter(request: Request):
+    client_ip = request.client.host if request.client else "unknown"
+    now = time.time()
+    rate_limit_records[client_ip] = [t for t in rate_limit_records[client_ip] if now - t < RATE_LIMIT_WINDOW_SECONDS]
+    if len(rate_limit_records[client_ip]) >= RATE_LIMIT_MAX_REQUESTS:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Rate limit exceeded. Maximum 10 requests per minute allowed."
+        )
+    rate_limit_records[client_ip].append(now)
+
+
+@router.post("", status_code=status.HTTP_201_CREATED, dependencies=[Depends(rate_limiter)])
+
 
 async def create_complaint(
     background_tasks: BackgroundTasks,
@@ -613,3 +738,197 @@ async def get_complaint_timeline(
         }
         for e in events
     ]
+
+
+from pydantic import BaseModel
+
+class ComplaintActionRequest(BaseModel):
+    action: str
+    note: Optional[str] = None
+    evidence_image_url: Optional[str] = None
+    jurisdiction_id: Optional[int] = None
+
+class ApprovalRequest(BaseModel):
+    note: Optional[str] = None
+
+
+@router.post("/{complaint_id}/actions", response_model=ComplaintRead)
+async def handle_complaint_action(
+    complaint_id: uuid.UUID,
+    request: ComplaintActionRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Execute transitions through the Workflow FSM for a complaint.
+    JWT is used directly to resolve the actor.
+    """
+    stmt = select(Complaint).where(Complaint.id == complaint_id)
+    res = await db.execute(stmt)
+    complaint = res.scalar_one_or_none()
+    if not complaint:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Complaint not found."
+        )
+
+    # Determine target status based on action
+    action = request.action.strip()
+    if action == "start_work":
+        target_status = "in_progress"
+    elif action == "mark_resolved":
+        target_status = "resolved"
+    elif action == "reject":
+        target_status = "in_progress"
+    elif action == "approve":
+        target_status = "closed"
+    elif action == "assign_manually":
+        target_status = "assigned"
+    elif action == "escalate":
+        target_status = "escalated"
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Action '{action}' is not recognized."
+        )
+
+    # Manual assignment extra validation and routing wiring
+    if action == "assign_manually":
+        if current_user.role not in ["supervisor", "admin"]:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only supervisors and administrators can manually assign complaints."
+            )
+        if request.jurisdiction_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Manual assignment action requires a valid jurisdiction_id."
+            )
+
+        # Fetch jurisdiction to resolve department automatically
+        stmt_j = select(Jurisdiction).where(Jurisdiction.id == request.jurisdiction_id)
+        res_j = await db.execute(stmt_j)
+        juris = res_j.scalar_one_or_none()
+        if not juris:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Jurisdiction {request.jurisdiction_id} does not exist."
+            )
+
+        complaint.jurisdiction_id = request.jurisdiction_id
+        complaint.department_id = juris.department_id
+
+    # Call FSM transition
+    from app.services.workflow_engine import transition_status
+    await transition_status(
+        db=db,
+        complaint=complaint,
+        target_status=target_status,
+        action=action,
+        actor=current_user,
+        note=request.note,
+        evidence_image_url=request.evidence_image_url
+    )
+
+    # If manual assignment is successful, route and calculate SLA and notifications
+    if action == "assign_manually":
+        from app.services.routing_engine import route_manually_assigned
+        await route_manually_assigned(db, complaint)
+
+    # Retrieve updated complaint details (including coordinates)
+    stmt_updated = select(
+        Complaint,
+        func.ST_X(Complaint.location).label("location_lng"),
+        func.ST_Y(Complaint.location).label("location_lat")
+    ).where(Complaint.id == complaint_id)
+    res_updated = await db.execute(stmt_updated)
+    row = res_updated.first()
+    comp, lng, lat = row
+
+    comp_dict = {c.name: getattr(comp, c.name) for c in comp.__table__.columns}
+    comp_dict["location_lng"] = lng
+    comp_dict["location_lat"] = lat
+    return ComplaintRead.model_validate(comp_dict)
+
+
+@router.post("/{complaint_id}/approve", response_model=ComplaintRead)
+async def approve_complaint(
+    complaint_id: uuid.UUID,
+    request: ApprovalRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Approve resolution of a complaint, closing it.
+    Satisfies FR-5.3.
+    """
+    # Quote FR-5.3:
+    # "FR-5.3: System shall require supervisor approval before a resolved complaint is closed."
+    stmt = select(Complaint).where(Complaint.id == complaint_id)
+    res = await db.execute(stmt)
+    complaint = res.scalar_one_or_none()
+    if not complaint:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Complaint not found."
+        )
+
+    # Call FSM to close
+    from app.services.workflow_engine import transition_status
+    await transition_status(
+        db=db,
+        complaint=complaint,
+        target_status="closed",
+        action="approve",
+        actor=current_user,
+        note=request.note or "Resolution approved by supervisor."
+    )
+
+    # Retrieve updated details
+    stmt_updated = select(
+        Complaint,
+        func.ST_X(Complaint.location).label("location_lng"),
+        func.ST_Y(Complaint.location).label("location_lat")
+    ).where(Complaint.id == complaint_id)
+    res_updated = await db.execute(stmt_updated)
+    row = res_updated.first()
+    comp, lng, lat = row
+
+    comp_dict = {c.name: getattr(comp, c.name) for c in comp.__table__.columns}
+    comp_dict["location_lng"] = lng
+    comp_dict["location_lat"] = lat
+    return ComplaintRead.model_validate(comp_dict)
+
+
+@router.get("/{complaint_id}/summary")
+async def get_complaint_summary(
+    complaint_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Generate and return a safe, explainable narrative summary for a complaint.
+    Satisfies FR-4.9.
+    """
+    # Fetch the complaint
+    stmt = select(Complaint).where(Complaint.id == complaint_id)
+    res = await db.execute(stmt)
+    complaint = res.scalar_one_or_none()
+    if not complaint:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Complaint not found."
+        )
+
+    # Citizen access control: citizens can only view summaries of their own complaints
+    if current_user.role == "citizen" and complaint.citizen_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied."
+        )
+
+    from app.services.narrative_generator import generate_narrative_summary
+    narrative = await generate_narrative_summary(db, complaint)
+    return {"summary": narrative}
+
+

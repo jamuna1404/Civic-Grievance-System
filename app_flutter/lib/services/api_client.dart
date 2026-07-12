@@ -30,6 +30,13 @@ class ApiClient {
     return http.post(url, headers: headers, body: jsonEncode(body));
   }
 
+  Future<http.Response> patch(String path, [Map<String, dynamic>? body]) async {
+    final url = Uri.parse('$baseUrl$path');
+    final headers = await _getHeaders();
+    return http.patch(url, headers: headers, body: body != null ? jsonEncode(body) : null);
+  }
+
+
   /// Sends multipart complaints request (FR-1.1 - FR-1.4)
   Future<http.StreamedResponse> postMultipart({
     required String path,

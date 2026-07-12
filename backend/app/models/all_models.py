@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, Index, func, Float, Boolean
+from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, Index, func, Float, Boolean, JSON
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 from geoalchemy2 import Geometry
@@ -84,6 +84,11 @@ class Complaint(Base):
 
     priority_score = Column(Integer, nullable=True)
     priority_label = Column(String, nullable=True)
+    priority_breakdown = Column(JSON, nullable=True)
+    resolved_image_url = Column(String, nullable=True)
+    resolved_note = Column(String, nullable=True)
+
+
     status = Column(String, nullable=False, default="registered")  # registered, assigned, in_progress, resolved, closed, escalated
     # location as a PostGIS Point column
     location = Column(Geometry(geometry_type="POINT", srid=4326), nullable=True)

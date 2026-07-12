@@ -96,6 +96,11 @@ class ComplaintBase(BaseModel):
 
     priority_score: Optional[int] = None
     priority_label: Optional[str] = None
+    priority_breakdown: Optional[dict] = None
+    resolved_image_url: Optional[str] = None
+    resolved_note: Optional[str] = None
+
+
     status: str = "registered"
     address_text: Optional[str] = None
     cluster_id: Optional[UUID] = None
