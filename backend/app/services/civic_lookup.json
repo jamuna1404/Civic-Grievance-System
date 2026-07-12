@@ -1,0 +1,21 @@
+{
+  "thanni": "water",
+  "neer": "water",
+  "kuppai": "garbage",
+  "salai": "road",
+  "pothole": "pothole",
+  "kuzhi": "pothole",
+  "vilakku": "streetlight",
+  "light": "streetlight",
+  "current": "electricity",
+  "minsaram": "electricity",
+  "maram": "tree",
+  "kaalvai": "drainage",
+  "saakadai": "sewer",
+  "kuzhai": "pipe",
+  "odai": "drainage",
+  "road-la": "road on",
+  "dangerous": "danger",
+  "periya": "large",
+  "romba": "very"
+}
