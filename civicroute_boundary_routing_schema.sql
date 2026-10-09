@@ -249,6 +249,9 @@ CREATE OR REPLACE FUNCTION resolve_officer_for_complaint(
     p_lon DOUBLE PRECISION,
     p_lat DOUBLE PRECISION
 ) RETURNS TABLE(officer_id UUID, boundary_id INT, designation_id INT) AS $$
+-- Ambiguous bare column names (e.g. boundary_id, designation_id) resolve to
+-- the table column, not the like-named OUT parameter of this function.
+#variable_conflict use_column
 DECLARE
     v_point GEOMETRY := ST_SetSRID(ST_Point(p_lon, p_lat), 4326);
     v_boundary_id INT;
@@ -264,7 +267,8 @@ BEGIN
       AND ST_Contains(b.geom, v_point)
     LIMIT 1;
 
-    SELECT MIN(rank_order) INTO v_min_rank FROM designations WHERE department_id = p_department_id;
+    SELECT MIN(d.rank_order) INTO v_min_rank
+    FROM designations d WHERE d.department_id = p_department_id;
 
     -- walk up the hierarchy until an ACTIVE officer is found or we run out of parents
     WHILE v_boundary_id IS NOT NULL LOOP
@@ -275,8 +279,8 @@ BEGIN
           AND o.boundary_id = v_boundary_id
           AND o.status = 'ACTIVE'
           AND o.designation_id = (
-              SELECT designation_id FROM designations
-              WHERE department_id = p_department_id AND rank_order = v_min_rank
+              SELECT d.designation_id FROM designations d
+              WHERE d.department_id = p_department_id AND d.rank_order = v_min_rank
           )
         LIMIT 1;
 
@@ -284,7 +288,8 @@ BEGIN
             RETURN;
         END IF;
 
-        SELECT parent_boundary_id INTO v_boundary_id FROM boundaries WHERE boundary_id = v_boundary_id;
+        SELECT b.parent_boundary_id INTO v_boundary_id
+        FROM boundaries b WHERE b.boundary_id = v_boundary_id;
     END LOOP;
 
     RETURN; -- no officer found anywhere in the hierarchy (data gap)

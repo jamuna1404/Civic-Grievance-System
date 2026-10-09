@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
@@ -14,19 +13,49 @@ import '../../citizen/complaints/presentation/widgets/photo_gallery.dart';
 import '../../citizen/complaints/presentation/widgets/status_timeline.dart';
 import '../application/officer_session_controller.dart';
 import '../data/officer_work_repository.dart';
+import 'widgets/review_control.dart';
 import 'widgets/status_update_control.dart';
+
+/// Which action control the officer detail screen should show at the bottom.
+enum OfficerDetailAction { review, statusUpdate, none }
+
+/// Pure decision for the control shown on the officer complaint detail:
+///   - Manage Team review buttons only for a RESOLUTION_REQUESTED complaint
+///     the officer can review;
+///   - the forward status-update control on the officer's own allotted
+///     complaints (which itself renders a read-only banner for terminal
+///     RESOLVED/REJECTED states);
+///   - nothing otherwise (e.g. a non-actionable item opened read-only from
+///     Manage Team or Track).
+OfficerDetailAction officerDetailActionFor({
+  required bool canReview,
+  required bool canUpdateStatus,
+  required ComplaintStatus status,
+}) {
+  if (canReview && status == ComplaintStatus.resolutionRequested) {
+    return OfficerDetailAction.review;
+  }
+  if (canUpdateStatus) return OfficerDetailAction.statusUpdate;
+  return OfficerDetailAction.none;
+}
 
 /// Navigation args for the officer complaint detail.
 class OfficerComplaintArgs {
   const OfficerComplaintArgs({
     required this.complaint,
     required this.canUpdateStatus,
+    this.canReview = false,
   });
 
   final ComplaintSummary complaint;
 
   /// True on the Allotted tab (assigned complaints), false on Track (read-only).
   final bool canUpdateStatus;
+
+  /// True from the Manage Team tab — shows Approve/Send Back when the
+  /// complaint is RESOLUTION_REQUESTED. Any other status stays read-only
+  /// even with this set, same as tapping a non-actionable item in that list.
+  final bool canReview;
 }
 
 /// Officer-facing complaint detail: citizen contact, photos, description,
@@ -79,6 +108,31 @@ class _OfficerComplaintDetailScreenState
     }
   }
 
+  Future<void> _review(String decision, String remarks) async {
+    final session = ref.read(officerSessionProvider);
+    if (session == null || _submitting) return;
+    setState(() => _submitting = true);
+    try {
+      await ref.read(officerWorkRepositoryProvider).reviewComplaint(
+            token: session.token,
+            complaintId: _c.complaintId,
+            decision: decision,
+            remarks: remarks.isEmpty ? null : remarks,
+          );
+      ref.invalidate(teamComplaintsProvider);
+      ref.invalidate(officerComplaintHistoryProvider(_c.complaintId));
+      if (!mounted) return;
+      _snack(
+        decision == 'APPROVE' ? 'Complaint approved and closed.' : 'Sent back for rework.',
+      );
+      context.pop();
+    } on ApiException catch (e) {
+      _snack(e.message);
+    } finally {
+      if (mounted) setState(() => _submitting = false);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -108,7 +162,20 @@ class _OfficerComplaintDetailScreenState
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text(dept.label, style: theme.textTheme.titleLarge),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Text(dept.label,
+                              style: theme.textTheme.titleLarge),
+                        ),
+                        Text(
+                          '#${_c.complaintId.length > 8 ? _c.complaintId.substring(0, 8) : _c.complaintId}',
+                          style: theme.textTheme.labelMedium?.copyWith(
+                            color: theme.colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                      ],
+                    ),
                     Text('Submitted ${absoluteDate(_c.createdAt)}',
                         style: theme.textTheme.bodySmall?.copyWith(
                           color: theme.colorScheme.onSurfaceVariant,
@@ -124,9 +191,10 @@ class _OfficerComplaintDetailScreenState
       ),
     );
 
-    final citizenContact = _c.citizenName != null || _c.citizenPhone != null
-        ? _CitizenContact(name: _c.citizenName, phone: _c.citizenPhone)
-        : const SizedBox.shrink();
+    // Never surface citizen identity here — a generic label only, per the
+    // officer-facing privacy requirement (this screen's data comes from
+    // v_officer_complaints, which doesn't even carry citizen_name/phone).
+    const reportedBy = _ReportedByBanner();
 
     final photos = _c.imageUrls.isNotEmpty
         ? Column(
@@ -201,19 +269,29 @@ class _OfficerComplaintDetailScreenState
           ),
           child: timelineContent,
         ),
-        if (widget.args.canUpdateStatus)
-          Padding(
-            padding: const EdgeInsets.fromLTRB(
-              AppSpacing.lg, 0, AppSpacing.lg, AppSpacing.xxl,
+        switch (officerDetailActionFor(
+          canReview: widget.args.canReview,
+          canUpdateStatus: widget.args.canUpdateStatus,
+          status: status,
+        )) {
+          OfficerDetailAction.review => Padding(
+              padding: const EdgeInsets.fromLTRB(
+                AppSpacing.lg, 0, AppSpacing.lg, AppSpacing.xxl,
+              ),
+              child: ReviewControl(submitting: _submitting, onDecide: _review),
             ),
-            child: StatusUpdateControl(
-              current: status,
-              submitting: _submitting,
-              onSubmit: _updateStatus,
+          OfficerDetailAction.statusUpdate => Padding(
+              padding: const EdgeInsets.fromLTRB(
+                AppSpacing.lg, 0, AppSpacing.lg, AppSpacing.xxl,
+              ),
+              child: StatusUpdateControl(
+                current: status,
+                submitting: _submitting,
+                onSubmit: _updateStatus,
+              ),
             ),
-          )
-        else
-          const SizedBox(height: AppSpacing.xxl),
+          OfficerDetailAction.none => const SizedBox(height: AppSpacing.xxl),
+        },
       ],
     );
 
@@ -232,7 +310,7 @@ class _OfficerComplaintDetailScreenState
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         header,
-                        citizenContact,
+                        reportedBy,
                         photos,
                         description,
                         location,
@@ -254,7 +332,7 @@ class _OfficerComplaintDetailScreenState
           return ListView(
             children: [
               header,
-              citizenContact,
+              reportedBy,
               photos,
               description,
               location,
@@ -267,11 +345,12 @@ class _OfficerComplaintDetailScreenState
   }
 }
 
-class _CitizenContact extends StatelessWidget {
-  const _CitizenContact({this.name, this.phone});
-
-  final String? name;
-  final String? phone;
+/// Deliberately generic — never the citizen's name or phone number. Officer
+/// endpoints read from v_officer_complaints, which has no citizen columns at
+/// all, so there is nothing identifying to show here even if this widget's
+/// code changed later.
+class _ReportedByBanner extends StatelessWidget {
+  const _ReportedByBanner();
 
   @override
   Widget build(BuildContext context) {
@@ -287,34 +366,9 @@ class _CitizenContact extends StatelessWidget {
         child: Row(
           children: [
             Icon(Icons.account_circle_outlined,
-                size: 36, color: theme.colorScheme.onSurfaceVariant),
+                size: 28, color: theme.colorScheme.onSurfaceVariant),
             const SizedBox(width: AppSpacing.md),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(name ?? 'Citizen', style: theme.textTheme.titleMedium),
-                  if (phone != null)
-                    Text(phone!,
-                        style: theme.textTheme.bodyMedium?.copyWith(
-                          color: theme.colorScheme.onSurfaceVariant,
-                        )),
-                ],
-              ),
-            ),
-            if (phone != null)
-              IconButton(
-                tooltip: 'Copy phone',
-                icon: const Icon(Icons.copy, size: 18),
-                onPressed: () {
-                  Clipboard.setData(ClipboardData(text: phone!));
-                  ScaffoldMessenger.of(context)
-                    ..hideCurrentSnackBar()
-                    ..showSnackBar(
-                      const SnackBar(content: Text('Phone number copied')),
-                    );
-                },
-              ),
+            Text('Citizen Report', style: theme.textTheme.titleMedium),
           ],
         ),
       ),

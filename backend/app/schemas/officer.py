@@ -56,6 +56,9 @@ class OfficerVerifyOtpResponse(BaseModel):
     full_name: str | None = None
     status: str | None = None
     officer_id: str | None = None
+    # True if any designation in this officer's department ranks below
+    # theirs — i.e. they have subordinates and should see "Manage Team".
+    manages_team: bool = False
 
 
 # --- Profile -----------------------------------------------------------------
@@ -73,3 +76,4 @@ class OfficerProfileResponse(BaseModel):
     jurisdiction_name: str
     status: str
     theme_mode: str = "SYSTEM"
+    manages_team: bool = False

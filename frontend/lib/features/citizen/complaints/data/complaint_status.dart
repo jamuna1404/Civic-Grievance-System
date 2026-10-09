@@ -9,6 +9,9 @@ enum ComplaintStatus {
   submitted('SUBMITTED', 'Submitted', Color(0xFF3A6EA5)), // blue
   acknowledged('ACKNOWLEDGED', 'Acknowledged', Color(0xFF6E56CF)), // violet
   inProgress('IN_PROGRESS', 'In progress', Color(0xFFC77700)), // amber
+  resolutionRequested(
+    'RESOLUTION_REQUESTED', 'Awaiting approval', Color(0xFF1C7C9C),
+  ), // teal
   resolved('RESOLVED', 'Resolved', Color(0xFF2E7D5B)), // green
   rejected('REJECTED', 'Rejected', Color(0xFFC1443B)); // red
 
@@ -31,6 +34,7 @@ enum ComplaintStatus {
     ComplaintStatus.submitted,
     ComplaintStatus.acknowledged,
     ComplaintStatus.inProgress,
+    ComplaintStatus.resolutionRequested,
     ComplaintStatus.resolved,
   ];
 }

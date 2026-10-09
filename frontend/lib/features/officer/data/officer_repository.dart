@@ -12,6 +12,7 @@ class OfficerVerifyResult {
     this.fullName,
     this.status,
     this.officerId,
+    this.managesTeam = false,
   });
 
   /// True when no officer exists for the number yet — they must enroll.
@@ -20,6 +21,7 @@ class OfficerVerifyResult {
   final String? fullName;
   final String? status;
   final String? officerId;
+  final bool managesTeam;
 }
 
 /// Result of a successful enrollment.
@@ -66,6 +68,7 @@ class OfficerRepository {
       fullName: json['full_name'] as String?,
       status: json['status'] as String?,
       officerId: json['officer_id'] as String?,
+      managesTeam: json['manages_team'] as bool? ?? false,
     );
   }
 

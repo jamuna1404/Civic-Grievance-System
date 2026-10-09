@@ -17,6 +17,8 @@ class ComplaintSummary {
     this.lon,
     this.citizenName,
     this.citizenPhone,
+    this.officerName,
+    this.officerDesignationName,
   });
 
   final String complaintId;
@@ -34,6 +36,12 @@ class ComplaintSummary {
   /// Citizen contact — populated for officer-facing views (for follow-up).
   final String? citizenName;
   final String? citizenPhone;
+
+  /// The subordinate officer this complaint is assigned to — populated only
+  /// for a manager's Team Complaints list/detail (fine to show; it's an
+  /// officer's identity, not a citizen's).
+  final String? officerName;
+  final String? officerDesignationName;
 
   bool get hasLocation => lat != null && lon != null;
 
@@ -63,6 +71,8 @@ class ComplaintSummary {
       lon: (json['lon'] as num?)?.toDouble(),
       citizenName: json['citizen_name'] as String?,
       citizenPhone: json['citizen_phone'] as String?,
+      officerName: json['officer_name'] as String?,
+      officerDesignationName: json['officer_designation_name'] as String?,
     );
   }
 }

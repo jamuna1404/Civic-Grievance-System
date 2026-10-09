@@ -18,9 +18,6 @@ BOUNDARY_ID = 11
 def _complaint(cid, status_, *, assigned=OFFICER_ID, boundary=BOUNDARY_ID):
     return {
         "complaint_id": cid,
-        "citizen_id": "cit-1",
-        "citizen_name": "Priya",
-        "citizen_phone": "+919876543210",
         "department_id": "GCC_ELECT",
         "department_name": "GCC Electrical",
         "description_text": "Light out",
@@ -57,10 +54,10 @@ def fake_db(monkeypatch):
         {"boundary_id": BOUNDARY_ID, "department_id": "GCC_ELECT",
          "level_name": "WARD", "boundary_name": "Ward 175"}
     )
-    # Complaints in complaint_details (view stand-in).
-    db.table("complaint_details").insert(_complaint("c-open", "IN_PROGRESS"))
-    db.table("complaint_details").insert(_complaint("c-done", "RESOLVED"))
-    db.table("complaint_details").insert(
+    # Complaints in v_officer_complaints (view stand-in) — no citizen fields.
+    db.table("v_officer_complaints").insert(_complaint("c-open", "IN_PROGRESS"))
+    db.table("v_officer_complaints").insert(_complaint("c-done", "RESOLVED"))
+    db.table("v_officer_complaints").insert(
         _complaint("c-other", "SUBMITTED", assigned=OTHER_OFFICER)
     )
     for mod in (officer_router, complaints_router):
@@ -82,7 +79,10 @@ def test_allotted_active_excludes_resolved_and_others(fake_db, client):
     assert resp.status_code == 200
     ids = {c["complaint_id"] for c in resp.json()}
     assert ids == {"c-open"}  # resolved + other-officer excluded
-    assert resp.json()[0]["citizen_phone"] == "+919876543210"
+    # Officer-facing list must never carry citizen identity — the view this
+    # route reads from (v_officer_complaints) never joins citizens at all.
+    assert resp.json()[0]["citizen_name"] is None
+    assert resp.json()[0]["citizen_phone"] is None
 
 
 def test_allotted_all_includes_resolved(fake_db, client):
@@ -142,6 +142,24 @@ def with_real_complaint(fake_db):
     return fake_db
 
 
+@pytest.fixture
+def with_acknowledged_complaint(fake_db):
+    fake_db.table("complaints").insert(
+        {"complaint_id": "c-open", "assigned_officer_id": OFFICER_ID,
+         "status": "ACKNOWLEDGED"}
+    )
+    return fake_db
+
+
+@pytest.fixture
+def with_in_progress_complaint(fake_db):
+    fake_db.table("complaints").insert(
+        {"complaint_id": "c-open", "assigned_officer_id": OFFICER_ID,
+         "status": "IN_PROGRESS"}
+    )
+    return fake_db
+
+
 def test_status_update_moves_forward(with_real_complaint, client):
     resp = client.put(
         "/complaints/c-open/status",
@@ -155,11 +173,11 @@ def test_status_update_moves_forward(with_real_complaint, client):
 
 
 def test_status_update_attaches_remarks_to_latest_history(
-    with_real_complaint, client
+    with_acknowledged_complaint, client
 ):
     # Simulate the trigger having logged a history row for this complaint.
-    with_real_complaint.table("complaint_status_history").insert(
-        {"complaint_id": "c-open", "status": "ACKNOWLEDGED", "remarks": None,
+    with_acknowledged_complaint.table("complaint_status_history").insert(
+        {"complaint_id": "c-open", "status": "IN_PROGRESS", "remarks": None,
          "changed_at": "2026-07-11T10:00:00+00:00"}
     )
     resp = client.put(
@@ -168,14 +186,14 @@ def test_status_update_attaches_remarks_to_latest_history(
         headers=_hdr(),
     )
     assert resp.status_code == 200
-    hist = with_real_complaint.table("complaint_status_history").rows[-1]
+    hist = with_acknowledged_complaint.table("complaint_status_history").rows[-1]
     assert hist["remarks"] == "Crew dispatched"
 
 
 def test_status_update_forbidden_for_non_assignee(with_real_complaint, client):
     resp = client.put(
         "/complaints/c-open/status",
-        json={"new_status": "RESOLVED"},
+        json={"new_status": "ACKNOWLEDGED"},
         headers=_hdr(OTHER_OFFICER),
     )
     assert resp.status_code == 403
@@ -190,6 +208,26 @@ def test_status_update_same_status_rejected(with_real_complaint, client):
     assert resp.status_code == 422  # SUBMITTED not an allowed target value
 
 
+def test_status_update_rejects_skipped_step(with_real_complaint, client):
+    # SUBMITTED can only move to ACKNOWLEDGED — not straight to IN_PROGRESS.
+    resp = client.put(
+        "/complaints/c-open/status",
+        json={"new_status": "IN_PROGRESS"},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 400
+
+
+def test_status_update_rejects_direct_resolve(with_in_progress_complaint, client):
+    # An officer cannot self-approve RESOLVED — only RESOLUTION_REQUESTED.
+    resp = client.put(
+        "/complaints/c-open/status",
+        json={"new_status": "RESOLVED"},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 400
+
+
 def test_status_update_unknown_complaint_404(fake_db, client):
     resp = client.put(
         "/complaints/nope/status",
@@ -197,3 +235,54 @@ def test_status_update_unknown_complaint_404(fake_db, client):
         headers=_hdr(),
     )
     assert resp.status_code == 404
+
+
+def test_resolution_requested_notifies_reviewing_officer(
+    with_in_progress_complaint, client, monkeypatch
+):
+    calls = []
+    monkeypatch.setattr(
+        complaints_router,
+        "notify_officer",
+        lambda officer_id, complaint_id: calls.append((officer_id, complaint_id)),
+    )
+    with_in_progress_complaint.set_rpc_result(
+        "resolve_reviewing_officer",
+        [{"officer_id": "supervisor-1", "boundary_id": BOUNDARY_ID, "designation_id": 2}],
+    )
+
+    resp = client.put(
+        "/complaints/c-open/status",
+        json={"new_status": "RESOLUTION_REQUESTED", "remarks": "Fixed the pole"},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "RESOLUTION_REQUESTED"
+    assert body["reviewer_assigned"] is True
+    assert calls == [("supervisor-1", "c-open")]
+
+
+def test_resolution_requested_with_no_reviewer_still_saves(
+    with_in_progress_complaint, client, monkeypatch
+):
+    calls = []
+    monkeypatch.setattr(
+        complaints_router,
+        "notify_officer",
+        lambda officer_id, complaint_id: calls.append((officer_id, complaint_id)),
+    )
+    with_in_progress_complaint.set_rpc_result("resolve_reviewing_officer", [])
+
+    resp = client.put(
+        "/complaints/c-open/status",
+        json={"new_status": "RESOLUTION_REQUESTED"},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "RESOLUTION_REQUESTED"
+    assert body["reviewer_assigned"] is False
+    assert calls == []
+    row = with_in_progress_complaint.table("complaints").rows[0]
+    assert row["status"] == "RESOLUTION_REQUESTED"

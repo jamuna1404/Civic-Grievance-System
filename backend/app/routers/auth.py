@@ -23,6 +23,7 @@ from app.schemas.auth import (
     VerifyOtpRequest,
     VerifyOtpResponse,
 )
+from app.routers.officer import officer_manages_team
 from app.schemas.officer import OfficerVerifyOtpResponse
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -228,4 +229,5 @@ def verify_officer_otp(payload: VerifyOtpRequest) -> OfficerVerifyOtpResponse:
         full_name=officer["full_name"],
         status=officer["status"],
         officer_id=officer["officer_id"],
+        manages_team=officer_manages_team(supabase, officer),
     )

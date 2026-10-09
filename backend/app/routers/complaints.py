@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.core.deps import get_current_citizen_id, get_current_officer_id
 from app.core.supabase_client import get_supabase
+from app.services.complaint_history import attach_remarks_to_latest
 from app.services.notifications import notify_officer
 from app.schemas.complaint import (
     ComplaintHistoryEntry,
@@ -19,6 +20,15 @@ from app.schemas.complaint import (
 )
 
 router = APIRouter(prefix="/complaints", tags=["complaints"])
+
+# The one valid forward move an assigned officer may make from each status.
+# RESOLUTION_REQUESTED is a dead end for the officer — only a supervisor
+# (not built here) can move it to RESOLVED/REJECTED.
+_ALLOWED_OFFICER_TRANSITIONS = {
+    "SUBMITTED": "ACKNOWLEDGED",
+    "ACKNOWLEDGED": "IN_PROGRESS",
+    "IN_PROGRESS": "RESOLUTION_REQUESTED",
+}
 
 
 def _can_view_complaint(supabase, complaint: dict, subject_id: str) -> bool:
@@ -133,6 +143,16 @@ def update_complaint_status(
             detail="The complaint is already in that status.",
         )
 
+    allowed_next = _ALLOWED_OFFICER_TRANSITIONS.get(complaint["status"])
+    if payload.new_status != allowed_next:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Can't move from {complaint['status']} to "
+                f"{payload.new_status}. Steps can't be skipped."
+            ),
+        )
+
     # Update status — the AFTER-UPDATE trigger logs the history row.
     supabase.table("complaints").update({"status": payload.new_status}).eq(
         "complaint_id", complaint_id
@@ -140,22 +160,22 @@ def update_complaint_status(
 
     # Attach remarks to the entry the trigger just created (latest for this
     # complaint).
-    if payload.remarks and payload.remarks.strip():
-        latest = (
-            supabase.table("complaint_status_history")
-            .select("history_id")
-            .eq("complaint_id", complaint_id)
-            .order("changed_at", desc=True)
-            .limit(1)
-            .execute()
-        )
-        if latest.data:
-            supabase.table("complaint_status_history").update(
-                {"remarks": payload.remarks.strip()}
-            ).eq("history_id", latest.data[0]["history_id"]).execute()
+    attach_remarks_to_latest(supabase, complaint_id, payload.remarks)
+
+    # Closure requests need a reviewing (next-rank) officer notified.
+    reviewer_assigned = False
+    if payload.new_status == "RESOLUTION_REQUESTED":
+        reviewer = supabase.rpc(
+            "resolve_reviewing_officer", {"p_complaint_id": complaint_id}
+        ).execute()
+        if reviewer.data:
+            notify_officer(reviewer.data[0]["officer_id"], complaint_id)
+            reviewer_assigned = True
 
     return UpdateStatusResponse(
-        complaint_id=complaint_id, status=payload.new_status
+        complaint_id=complaint_id,
+        status=payload.new_status,
+        reviewer_assigned=reviewer_assigned,
     )
 
 

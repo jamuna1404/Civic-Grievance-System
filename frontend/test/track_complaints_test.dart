@@ -112,13 +112,14 @@ void main() {
       ]));
       await tester.pumpAndSettle();
 
-      // All four canonical stages are present…
+      // All five canonical stages are present…
       expect(find.text('Submitted'), findsOneWidget);
       expect(find.text('Acknowledged'), findsOneWidget);
       expect(find.text('In progress'), findsOneWidget);
+      expect(find.text('Awaiting approval'), findsOneWidget);
       expect(find.text('Resolved'), findsOneWidget);
-      // …with Acknowledged and Resolved not yet reached.
-      expect(find.text('Pending'), findsNWidgets(2));
+      // …with Acknowledged, Awaiting approval, and Resolved not yet reached.
+      expect(find.text('Pending'), findsNWidgets(3));
       expect(find.text('Crew dispatched'), findsOneWidget);
     });
 

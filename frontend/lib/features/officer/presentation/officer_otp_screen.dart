@@ -49,6 +49,7 @@ class _OfficerOtpScreenState extends ConsumerState<OfficerOtpScreen> {
               fullName: result.fullName!,
               officerId: result.officerId!,
               status: result.status!,
+              managesTeam: result.managesTeam,
             );
         // Router redirects to officer home.
       }

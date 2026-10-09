@@ -21,6 +21,7 @@ class OfficerProfile {
     required this.themeMode,
     this.email,
     this.employeeId,
+    this.managesTeam = false,
   });
 
   final String fullName;
@@ -32,6 +33,7 @@ class OfficerProfile {
   final ThemeMode themeMode;
   final String? email;
   final String? employeeId;
+  final bool managesTeam;
 
   factory OfficerProfile.fromJson(Map<String, dynamic> json) => OfficerProfile(
         fullName: json['full_name'] as String,
@@ -43,6 +45,7 @@ class OfficerProfile {
         themeMode: ThemeModeApi.fromApi(json['theme_mode'] as String?),
         email: json['email'] as String?,
         employeeId: json['employee_id'] as String?,
+        managesTeam: json['manages_team'] as bool? ?? false,
       );
 }
 
@@ -74,6 +77,46 @@ class OfficerWorkRepository {
     return data
         .map((e) => ComplaintSummary.fromJson(e as Map<String, dynamic>))
         .toList();
+  }
+
+  Future<List<ComplaintSummary>> teamComplaints({
+    required String token,
+    required String officerId,
+  }) async {
+    final data = await _api.getJsonList(
+      '/officer/$officerId/team-complaints',
+      token: token,
+    );
+    return data
+        .map((e) => ComplaintSummary.fromJson(e as Map<String, dynamic>))
+        .toList();
+  }
+
+  /// The boundary_ids this officer manages (own + descendants). Fetched once
+  /// at login and cached to filter realtime closure-request events.
+  Future<List<int>> teamBoundaryScope({
+    required String token,
+    required String officerId,
+  }) async {
+    final data = await _api.getJsonList(
+      '/officer/$officerId/team-boundary-scope',
+      token: token,
+    );
+    return data.map((e) => e as int).toList();
+  }
+
+  /// A manager's decision on a subordinate's closure request.
+  Future<void> reviewComplaint({
+    required String token,
+    required String complaintId,
+    required String decision, // 'APPROVE' | 'SEND_BACK'
+    String? remarks,
+  }) async {
+    await _api.putJson(
+      '/officer/complaints/$complaintId/review',
+      {'decision': decision, if (remarks != null) 'remarks': remarks},
+      token: token,
+    );
   }
 
   Future<void> updateStatus({
@@ -112,6 +155,16 @@ final allottedComplaintsProvider =
   final session = ref.watch(officerSessionProvider);
   if (session == null) return [];
   return ref.read(officerWorkRepositoryProvider).allotted(
+        token: session.token,
+        officerId: session.officerId,
+      );
+});
+
+final teamComplaintsProvider =
+    FutureProvider.autoDispose<List<ComplaintSummary>>((ref) async {
+  final session = ref.watch(officerSessionProvider);
+  if (session == null) return [];
+  return ref.read(officerWorkRepositoryProvider).teamComplaints(
         token: session.token,
         officerId: session.officerId,
       );

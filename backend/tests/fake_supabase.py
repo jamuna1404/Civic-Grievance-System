@@ -19,6 +19,7 @@ class _Query:
         self._table = table
         self._filters: list[tuple[str, object]] = []
         self._neq_filters: list[tuple[str, object]] = []
+        self._lt_filters: list[tuple[str, object]] = []
         self._in_filters: list[tuple[str, list]] = []
         self._order_key: str | None = None
         self._order_desc = False
@@ -34,6 +35,10 @@ class _Query:
 
     def in_(self, column, values):
         self._in_filters.append((column, list(values)))
+        return self
+
+    def lt(self, column, value):
+        self._lt_filters.append((column, value))
         return self
 
     def order(self, column, desc: bool = False):
@@ -52,6 +57,7 @@ class _Query:
             if all(row.get(c) == v for c, v in self._filters)
             and all(row.get(c) != v for c, v in self._neq_filters)
             and all(row.get(c) in vs for c, vs in self._in_filters)
+            and all(row.get(c) is not None and row[c] < v for c, v in self._lt_filters)
         ]
         if self._order_key:
             rows.sort(
